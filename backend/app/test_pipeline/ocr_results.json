@@ -1,0 +1,74 @@
+[
+  {
+    "file": "correct_aadhaar.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_aadhaar.jpg",
+    "success": true,
+    "elapsedSeconds": 0.68,
+    "ocrConfidence": 0.94,
+    "rawTextLength": 100,
+    "rawText": "PHOTO\n\nGOVERNMENT OF INDIA\n\nName\nRohan Gupta\n\nDoB:\n15-07-1993\n\nGender:\nMale\n\n1234 5678 9012\n\nQR CODE"
+  },
+  {
+    "file": "correct_cancelled_cheque.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_cancelled_cheque.jpg",
+    "success": true,
+    "elapsedSeconds": 0.82,
+    "ocrConfidence": 0.91,
+    "rawTextLength": 171,
+    "rawText": "STATE BANK OF INDIA\n\nBRANCH: MAIN CITY, MUMBAI 400053\n\nPAY\n\nIFSC: SBIN0001234\n\nDDMMYYYY\n\nOR ORDER\n\nRUPEES\n\nAlc No. | 0000123456789\n\nle |\n\nAUTHORIZED SIGNATORY\n\nROHAN GUPTA"
+  },
+  {
+    "file": "correct_marksheet.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_marksheet.jpg",
+    "success": true,
+    "elapsedSeconds": 0.69,
+    "ocrConfidence": 0.95,
+    "rawTextLength": 165,
+    "rawText": "CENTRAL BOARD OF SECONDARY EDUCATION\nMARKSHEET\n\nName: Rohan Gupta D.O.B: 15-07-1993\n\nFather's Name: Suresh Gupta\n\nSubject\n\nEnglish\nMathematics\n\nScience\n\nResult: PASS"
+  },
+  {
+    "file": "correct_offer_letter.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_offer_letter.jpg",
+    "success": true,
+    "elapsedSeconds": 1.18,
+    "ocrConfidence": 0.9,
+    "rawTextLength": 829,
+    "rawText": "JADE SOLUTIONS PVT LTD elo@yadesotutonscom\n\nJOB OFFER LETTER Date: 01-Aug-2028\n\nTo,\nRohan Gupta\nNavi Mumbai, MH\n\nDear Rohan Gupta,\n\nWe are pleased to offer you the position of Senior Marketing Specialist at Jade Solutions Pvt Ltd.\nYour skills and experience will be a valuable addition to our team.\n\nDetails of the Offer:\n+ Position: Senior Marketing Specialist\n+ Grade Level: L3 - Professional\n+ Start Date / DOJ: 01-Aug-2023\n* Work Location: Main Office, Pune, Maharashtra\n+ Contract Type: Full-Time\n\nBelow is the breakdown of your Compensation Structure (CTC).\n\nSalary Component Amount (INR Annual)\nBasic Salary 6,00,000\n\nHRA (House Rent Allowance) % 2,40,000\n\nPF & Gratuity 60,000\n\nTOTAL CTC = 9,00,000\n\nDigitally Signed Acceples BY\n\nBy: Daniel Gallego (HR Director)\nDate: 01-Aug-2023\nReason: Authorized Job Offer Rohan Gupta"
+  },
+  {
+    "file": "correct_pan.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_pan.jpg",
+    "success": true,
+    "elapsedSeconds": 0.57,
+    "ocrConfidence": 0.88,
+    "rawTextLength": 181,
+    "rawText": "INCOME TAX DEPARTMENT\nGOVT. OF INDIA\n\nPHOTO\n\nName / [a]\nRohan Gupta\n\nQR CODE\nFather's Name /\n\nSuresh Gupta [=]\n\nDate of Birth /\n15-07-1993\n\nPermanent Account Number Card\n\nABCDE1234F"
+  },
+  {
+    "file": "correct_pf_form_11.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_pf_form_11.jpg",
+    "success": true,
+    "elapsedSeconds": 0.97,
+    "ocrConfidence": 0.93,
+    "rawTextLength": 498,
+    "rawText": "Composite Declaration Form - 11\nEMPLOYEES' PROVIDENT FUND ORGANISATION\n\nName of the member\n\nRohan Gupta\n\nFather's Name\n\nSuresh Gupta\n\nDate of Birth (DD/MM/YYYY)\n\n15-07-1993\n\nGender\n\nMale\n\nMarital Status\n\nUnmarried\n\n(a) Email 1D\n(b) Mobile No.\n\ncandidate@email.com\n9123XXXX45\n\nPresent employment details\nDate of joining\n\n01-Aug-2023\n\nKYC Details\n(a) Bank A/C No\n(b) IFS Code\n\n(c) AADHAAR No.\n(d) PAN\n\n0000123456789\nSBIN0001234\n[Aadhaar Redacted]\nABCDE1234F\n\nWhether earlier a member of PF Scheme\n\nNo"
+  },
+  {
+    "file": "correct_resume.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_resume.jpg",
+    "success": true,
+    "elapsedSeconds": 0.69,
+    "ocrConfidence": 0.94,
+    "rawTextLength": 240,
+    "rawText": "Rohan Gupta\n\nM\n\nCONTACT\n\nEmait\nrohan. mail.com\n\nSUMMARY\n\nHighly motivated professional with a strong background.\nReady to excel in a challenging environment.\n\nEDUCATION\n\nBachelor of Technology\nNational University of Technology\nClass of 2026"
+  },
+  {
+    "file": "correct_self_declaration.jpg",
+    "path": "C:\\Users\\shivam.mishra_jadegl\\Downloads\\hr-onboarding-verification-fastapi\\hr-onboarding-verification-fastapi\\backend\\app\\valid_test_documents\\correct_self_declaration.jpg",
+    "success": true,
+    "elapsedSeconds": 0.75,
+    "ocrConfidence": 0.95,
+    "rawTextLength": 292,
+    "rawText": "Self-Declaration Form\n\n|, Rohan Gupta, son of Suresh Gupta, present address:\n\nHouse # 07, Road # 03, Ananda Nagar, Mumbai - 400053, joined in\n\nJade Solutions Pvt Ltd as a Financial Analyst on 01-Aug-2023. Currently | am\nworking here with honesty and integrity.\n\nFaithfully Yours,\n\nRohan Gupta"
+  }
+]
