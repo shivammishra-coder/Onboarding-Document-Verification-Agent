@@ -193,18 +193,16 @@ def evaluate_dossier(dossier: Dict[str, Dict[str, Any]], candidate_profile: Dict
                     if not relieving:
                         issues.append("Standard transition detected: Formal Relieving Letter from most recent employer is mandatory.")
 
-    # ==========================================
+# ==========================================
     # 6. GAP DECLARATION LOGIC (Applies to all)
     # ==========================================
     # For freshers, gap is DOJ - Graduation Date. For Laterals, gap is DOJ - LWD.
-    # Assuming we pull graduation date from MARKSHEET or DEGREE if fresher.
     gap_start_date = lwd_date
-    if is_fresher:
-        marksheet = dossier.get("MARKSHEET", {})
-        passing_year = marksheet.get("passing_year")
-        if passing_year:
-            # Approximate gap from July 1st of graduation year
-            gap_start_date = f"{passing_year}-07-01"
+    
+    if is_fresher and passing_year:
+        # Approximate gap from July 1st of graduation year using the variable 
+        # we already extracted cleanly at the top of the function
+        gap_start_date = f"{passing_year}-07-01"
 
     if jade_doj and gap_start_date:
         days_gap = _calculate_days_between(jade_doj, gap_start_date)

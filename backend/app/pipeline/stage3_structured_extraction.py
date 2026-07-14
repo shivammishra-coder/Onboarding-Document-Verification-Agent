@@ -1,21 +1,22 @@
 """
 STAGE 3 - Structured Extraction
 
-Root causes fixed here (carried over from the Groq version, still apply):
-1. Retry/backoff on 429 and 5xx - a self-hosted service behind a VPN can
-   still hit transient failures (cold-start timeouts, brief connection
-   drops), so retries stay in place even without Groq's per-minute limits.
-2. Date fields are extracted verbatim and normalized/validated in Python -
-   an OCR-corrupted "45-07-1993" fails validation instead of being
-   silently reformatted into something wrong-but-plausible.
-3. Integer fields get explicit type coercion so a malformed value can't
-   crash the rule engine downstream.
-4. NEW: some models on this endpoint (qwen3:14b, gpt-oss:20b) support a
-   "thinking mode" that can prepend <think>...</think> reasoning text
-   even when JSON output is requested. That's stripped out before
-   json.loads so thinking-mode models don't break parsing.
+Classification already happened in Stage 1 - this stage TRUSTS the
+doc_type it's given and only asks the LLM to extract THAT type's fields.
+
+NEW in this version:
+- _normalize_id_fields(): strips ALL whitespace (not just leading/trailing)
+  from PAN/Aadhaar/IFSC/account numbers and uppercases them, BEFORE shape
+  validation and BEFORE the rule engine ever sees them. Fixes two real
+  false-positive classes: (1) an OCR-corrupted bilingual label leaving
+  stray characters like "/ " glued onto a date, and (2) two genuinely
+  identical account numbers being flagged as a "mismatch" purely because
+  one had an internal space and the other didn't.
+- _clean_raw_date_string(): strips leading punctuation/slashes left over
+  from "Label / लेबल: value"-style bilingual OCR text, so a date that IS
+  really parseable doesn't get thrown out just because of a stray prefix
+  character none of the format strings could ever match.
 """
-import asyncio
 import json
 import re
 from datetime import datetime
@@ -23,221 +24,205 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from app.config import OLLAMA_BASE_URL, OLLAMA_USERNAME, OLLAMA_PASSWORD, OLLAMA_MODEL
+from app.pipeline.ollama_client import build_payload, call_ollama_with_retry, strip_thinking_blocks
 
-OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL.rstrip('/')}/v1/chat/completions"
-
-MAX_RETRIES = 3
-BASE_BACKOFF_SECONDS = 3
-
+# Shape patterns now assume PRE-CLEANED values (all whitespace already
+# stripped by _normalize_id_fields) - so aadhaar_number no longer needs to
+# tolerate optional spaces, and account_number gets a real check for the
+# first time (previously not validated at all).
 FIELD_SHAPE_PATTERNS = {
     "pan_number": re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$"),
-    "aadhaar_number": re.compile(r"^\d{4}\s?\d{4}\s?\d{4}$"),
+    "aadhaar_number": re.compile(r"^\d{12}$"),
     "ifsc_code": re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$"),
+    "account_number": re.compile(r"^\d{6,20}$"),  # bank account lengths vary widely by bank; loose bound
 }
+
+ID_LIKE_FIELDS = {"pan_number", "aadhaar_number", "ifsc_code", "account_number"}
 
 DATE_FIELDS = {"dob", "doj", "last_working_day", "gap_start_date", "gap_end_date"}
 INTEGER_FIELDS = {"passing_year", "total_points_filled"}
-
-#  new code
-LIST_FIELDS = {"employers", "months_provided"}  # simple flat lists that shouldn't contain nulls
-
-def _clean_list_fields(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Strips None/empty entries from list-typed fields. The model sometimes
-    returns [null] instead of [] when it correctly finds nothing to extract -
-    this normalizes that so downstream `if not some_list` checks work as intended."""
-    extracted = result.get("extracted_data", {})
-    for field in LIST_FIELDS:
-        if field in extracted and isinstance(extracted[field], list):
-            extracted[field] = [item for item in extracted[field] if item]
-    result["extracted_data"] = extracted
-    return result
+LIST_FIELDS = {"employers", "months_provided"}
+BOOLEAN_FIELDS = {
+    "has_joining_bonus", "is_ctc_signed", "is_bonus_signed",
+    "contains_official_signoff_text", "has_supplementary_or_backlog_text",
+}
 
 DATE_FORMATS_TO_TRY = [
-    "%d-%m-%Y",
-    "%Y-%m-%d",
-    "%d/%m/%Y",
-    "%B %d, %Y",
-    "%d %B %Y",
-    "%d-%b-%Y",    # <-- "01-Aug-2023" - your self-declaration format
-    "%d %b %Y",    # "01 Aug 2023" (space instead of dash)
-    "%d-%b-%y",    # "01-Aug-23" (2-digit year, in case a document uses it)
-    "%b %d, %Y",   # "Aug 01, 2023"
+    "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%B %d, %Y", "%d %B %Y",
+    "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%b %d, %Y",
 ]
 
-THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
-
-SCHEMA_REFERENCE = (
-    "PAN_CARD:[name,dob,pan_number] "
-    "AADHAAR_CARD:[name,dob,aadhaar_number] "
-    "SELF_DECLARATION_FORM:[candidate_name,doj] "
-    "PF_FORM_11:[candidate_name,account_number,ifsc_code,total_points_filled:int] "
-    "CANCELLED_CHEQUE:[account_number,ifsc_code] "
-    "RESUME:[candidate_name,employers:list[str]] "
-    "UAN_SCREENSHOT:[employment_history:list[{company_name,start_date,end_date}]] "
-    "SIGNED_OFFER_LETTER_JADE:[candidate_name,grade,location,has_joining_bonus:bool,is_ctc_signed:bool,is_bonus_signed:bool] "
-    "PAYSLIP:[company_name,months_provided:list[str]] "
-    "RESIGNATION_ACCEPTANCE:[company_name,last_working_day,contains_official_signoff_text:bool] "
-    "RELIEVING_LETTER:[company_name,last_working_day,contains_official_signoff_text:bool] "
-    "MARKSHEET:[qualification_level,passing_year:str,has_supplementary_or_backlog_text:bool] "
-    "DEGREE_CERTIFICATE:[qualification_level,passing_year:str] "
-    "OFFER_LETTER_PREVIOUS_ORG:[company_name,candidate_name] "
-    "GAP_DECLARATION_FORM:[gap_start_date,gap_end_date,reason_for_gap] "
-    "GAP_AFFIDAVIT:[gap_start_date,gap_end_date,reason_for_gap] "
-    "UNKNOWN:[]"
-)
+DOC_TYPE_FIELDS: Dict[str, list] = {
+    "PAN_CARD": ["name", "dob", "pan_number"],
+    "AADHAAR_CARD": ["name", "dob", "aadhaar_number"],
+    "SELF_DECLARATION_FORM": ["candidate_name", "doj"],
+    "PF_FORM_11": ["candidate_name", "account_number", "ifsc_code", "total_points_filled (integer)"],
+    "CANCELLED_CHEQUE": ["account_number", "ifsc_code"],
+    "RESUME": ["candidate_name", "employers (list of strings - COMPANY/EMPLOYER names only, from a Work Experience/Employment section - NOT schools, colleges, or universities from an Education section)"],
+    "UAN_SCREENSHOT": ["employment_history (list of objects: company_name, start_date, end_date)"],
+    "OFFER_LETTER_PREVIOUS_ORG": ["company_name", "candidate_name"],
+    "PAYSLIP": ["company_name", "months_provided (list of strings)"],
+    "RESIGNATION_ACCEPTANCE": ["company_name", "last_working_day", "contains_official_signoff_text (boolean)"],
+    "RELIEVING_LETTER": ["company_name", "last_working_day", "contains_official_signoff_text (boolean)"],
+    "MARKSHEET": ["qualification_level", "passing_year", "has_supplementary_or_backlog_text (boolean)"],
+    "DEGREE_CERTIFICATE": ["qualification_level", "passing_year"],
+    "SIGNED_OFFER_LETTER_JADE": ["candidate_name", "grade", "location", "has_joining_bonus (boolean)", "is_ctc_signed (boolean)", "is_bonus_signed (boolean)"],
+    "GAP_DECLARATION_FORM": ["gap_start_date", "gap_end_date", "reason_for_gap"],
+    "GAP_AFFIDAVIT": ["gap_start_date", "gap_end_date", "reason_for_gap"],
+}
 
 
-async def process_document(ocr_text: str, original_filename: str = "") -> Dict[str, Any]:
-    if not OLLAMA_USERNAME or not OLLAMA_PASSWORD:
-        return _build_error_response("OLLAMA_USERNAME/OLLAMA_PASSWORD are missing. Cannot perform AI extraction.")
+async def process_document(
+    ocr_text: str, doc_type: str, client: httpx.AsyncClient, original_filename: str = ""
+) -> Dict[str, Any]:
+    fields = DOC_TYPE_FIELDS.get(doc_type)
+    if not fields:
+        return {"document_type": doc_type, "extracted_data": {}, "_ocrTextPreview": ocr_text[:500]}
 
-    prompt = _build_unified_prompt(ocr_text, original_filename)
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0,
-    }
+    prompt = _build_extraction_prompt(ocr_text, doc_type, fields, original_filename)
+    payload = build_payload(prompt)
 
     try:
-        # Basic Auth per the endpoint guide. 120s timeout covers a cold
-        # model load (up to ~8s) plus generation time for our JSON-sized
-        # output; bump higher if you switch to gpt-oss:20b under load.
-        async with httpx.AsyncClient(auth=(OLLAMA_USERNAME, OLLAMA_PASSWORD), timeout=120.0) as client:
-            response = await _call_ollama_with_retry(client, payload)
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            content = _strip_thinking_blocks(content)
-            parsed_result = json.loads(content)
+        response = await call_ollama_with_retry(client, payload)
+        content = response.json()["choices"][0]["message"]["content"]
+        content = strip_thinking_blocks(content)
+        parsed_result = json.loads(content)
 
-            normalized_result = {
-                "document_type": parsed_result.get("document_type", "UNKNOWN"),
-                "confidence_score": float(parsed_result.get("confidence_score", 0.0)),
-                "extracted_data": parsed_result.get("extracted_data", {}),
-            }
+        normalized_result = {
+            "document_type": doc_type,
+            "extracted_data": parsed_result.get("extracted_data", parsed_result),
+        }
 
-            result = _apply_shape_warnings(normalized_result)
-            result = _normalize_and_validate_dates(result)
-            result = _coerce_integer_fields(result)
-            result = _clean_list_fields(result)
-            result["_ocrTextPreview"] = ocr_text[:500]  # debug aid - tells you OCR vs LLM fault
-            return result
+        # NOTE: order matters - normalize ID fields FIRST, so shape
+        # validation (next step) checks the cleaned value, not the raw
+        # OCR-artifact-laden one.
+        result = _normalize_id_fields(normalized_result)
+        result = _apply_shape_warnings(result)
+        result = _normalize_and_validate_dates(result)
+        result = _coerce_integer_fields(result)
+        result = _coerce_boolean_fields(result)
+        result = _clean_list_fields(result)
+        result = _filter_resume_employers(result)   # <-- add this
+        result["_ocrTextPreview"] = ocr_text[:500]
+        return result
 
     except httpx.TimeoutException:
-        return _build_error_response("Ollama request timed out (check VPN/network, or the model may still be cold-starting).")
+        return _build_error_response(doc_type, "Ollama request timed out.")
     except json.JSONDecodeError:
-        return _build_error_response("Ollama returned malformed JSON (possibly unstripped thinking-mode output).")
+        return _build_error_response(doc_type, "Ollama returned malformed JSON.")
     except Exception as e:
-        return _build_error_response(f"Unexpected error during extraction: {str(e)}")
+        return _build_error_response(doc_type, f"Unexpected error during extraction: {str(e)}")
 
 
-async def _call_ollama_with_retry(client: httpx.AsyncClient, payload: dict) -> httpx.Response:
-    """
-    Retries on 429/5xx and on transient connection errors/timeouts - a
-    self-hosted endpoint behind a corporate VPN can occasionally drop a
-    connection or take longer than expected on a cold model load, even
-    without Groq-style per-minute rate limits.
-    """
-    last_exception: Optional[Exception] = None
-    response: Optional[httpx.Response] = None
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = await client.post(OLLAMA_CHAT_URL, json=payload)
-        except (httpx.ConnectError, httpx.TimeoutException) as err:
-            last_exception = err
-            wait_seconds = BASE_BACKOFF_SECONDS * (2 ** attempt)
-            print(f"  [connection issue] {err!r} - waiting {wait_seconds:.1f}s (retry {attempt + 1}/{MAX_RETRIES})...")
-            await asyncio.sleep(wait_seconds)
-            continue
-
-        if response.status_code == 429:
-            retry_after = response.headers.get("retry-after")
-            wait_seconds = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2 ** attempt)
-            print(f"  [rate limited] waiting {wait_seconds:.1f}s (retry {attempt + 1}/{MAX_RETRIES})...")
-            await asyncio.sleep(wait_seconds)
-            continue
-
-        if response.status_code >= 500:
-            print(f"  [server error {response.status_code}] waiting before retry {attempt + 1}/{MAX_RETRIES}...")
-            await asyncio.sleep(BASE_BACKOFF_SECONDS * (2 ** attempt))
-            continue
-
-        response.raise_for_status()
-        return response
-
-    if last_exception:
-        raise last_exception
-    raise httpx.HTTPStatusError(
-        f"Ollama API failed after {MAX_RETRIES} retries",
-        request=response.request,
-        response=response,
-    )
-
-
-def _strip_thinking_blocks(content: str) -> str:
-    """
-    qwen3:14b and gpt-oss:20b support "thinking mode" and can prepend
-    <think>...reasoning...</think> before the actual JSON, even when
-    response_format=json_object is requested. Strip it defensively so
-    json.loads doesn't choke on it. llama3.1:8b doesn't use this at all,
-    so this is a no-op for that model.
-    """
-    stripped = THINK_BLOCK_PATTERN.sub("", content).strip()
-    return stripped if stripped else content
-
-
-def _build_unified_prompt(ocr_text: str, filename: str) -> str:
-    return f"""You are an expert HR Document Analyzer.
-Classify the document and extract fields into JSON.
+def _build_extraction_prompt(ocr_text: str, doc_type: str, fields: list, filename: str) -> str:
+    field_list_str = ", ".join(fields)
+    resume_warning = ""
+    if doc_type == "RESUME":
+         resume_warning = (
+            "\n6. For 'employers': only include organizations from a Work "
+            "Experience/Employment/Professional Experience section. Do NOT "
+            "include schools, colleges, or universities listed under an "
+            "Education section - those are not employers, even if no "
+            "explicit employer section exists at all. If the resume has no "
+            "work experience section, employers MUST be an empty list []."
+           )
+    return f"""You are an expert HR Document data extractor.
+This document has ALREADY been classified as: {doc_type}
+Extract ONLY the following fields: {field_list_str}
 
 FILENAME HINT: "{filename}"
 
 OCR TEXT:
 {ocr_text}
 
-DOCUMENT TYPES & FIELDS: {SCHEMA_REFERENCE}
-
 RULES:
-1. Reply ONLY with valid JSON.
-2. Pick the single best document_type from the list.
-3. Populate extracted_data ONLY with fields required for that type.
-4. If a field is not present, set it to null. DO NOT guess or infer.
-5. For ANY date field, extract it EXACTLY AS PRINTED on the document
-   (e.g. "15-07-1993") - do NOT reformat, reorder, or convert it.
-   Date normalization is handled separately, outside this step.
-6. confidence_score is a float 0.0-1.0.
-7. Do not include any reasoning, explanation, or <think> tags - output
-   ONLY the JSON object below.
-
-OUTPUT FORMAT:
-{{"document_type": "<Type>", "confidence_score": 0.95, "extracted_data": {{}}}}
+1. Reply ONLY with valid JSON: {{"extracted_data": {{...}}}}
+2. If a field is not present in the text, set it to null. DO NOT guess or infer.
+3. For ANY date field, extract ONLY the date value itself, EXACTLY AS
+   PRINTED (e.g. "15-07-1993") - do NOT include surrounding labels,
+   separators, or punctuation (e.g. a bilingual "Label / लेबल:" prefix).
+   Do not reformat, reorder, or convert the date - normalization happens
+   separately.
+4. For ID/account numbers, extract the digits/characters only, exactly
+   as printed - internal spacing is fine either way, it will be
+   normalized separately.
+5. Do not include reasoning, explanation, or <think> tags - JSON only.{resume_warning}
 """
+
+
+def _normalize_id_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Strips ALL whitespace (not just leading/trailing) and uppercases
+    PAN/Aadhaar/IFSC/account numbers. Fixes two real bugs seen in
+    production: an Aadhaar/PAN "12 34 56" style OCR spacing difference
+    causing a false identity mismatch, and a bank account number with an
+    internal space being flagged as not matching an otherwise-identical
+    number with no space."""
+    extracted = result.get("extracted_data", {})
+    for field in ID_LIKE_FIELDS:
+        if field in extracted and extracted[field]:
+            extracted[field] = re.sub(r"\s+", "", str(extracted[field])).upper()
+    result["extracted_data"] = extracted
+    return result
 
 
 def _apply_shape_warnings(result: Dict[str, Any]) -> Dict[str, Any]:
     extracted = result.get("extracted_data", {})
-    warnings = []
+    warnings = list(result.get("shape_warnings", []))
     for field_name, pattern in FIELD_SHAPE_PATTERNS.items():
         val = extracted.get(field_name)
-        if val:
-            clean_val = str(val).replace(" ", "").strip() if field_name == "aadhaar_number" else str(val).strip()
-            if not pattern.match(clean_val):
-                warnings.append(f"{field_name} value '{val}' does not match the expected structural format.")
+        if val and not pattern.match(str(val)):
+            warnings.append(f"{field_name} value '{val}' does not match the expected structural format.")
     if warnings:
         result["shape_warnings"] = warnings
     return result
 
+EDUCATION_KEYWORDS = {
+    "university", "college", "institute", "school", "academy",
+    "polytechnic", "vidyalaya", "vishwavidyalaya",
+}
+
+def _filter_resume_employers(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Drops any 'employer' entry that's actually an educational
+    institution - a common LLM confusion when a resume has no explicit
+    Work Experience section (see the 'National University of Technology'
+    case). Keeps the entry with a shape_warning instead of silently
+    dropping it, so HR can see something WAS filtered out."""
+    if result.get("document_type") != "RESUME":
+        return result
+
+    extracted = result.get("extracted_data", {})
+    employers = extracted.get("employers")
+    if not isinstance(employers, list):
+        return result
+
+    warnings = list(result.get("shape_warnings", []))
+    clean_employers = []
+    for e in employers:
+        if e and any(kw in str(e).lower() for kw in EDUCATION_KEYWORDS):
+            warnings.append(f"employers: dropped '{e}' - looks like an educational institution, not a company")
+        else:
+            clean_employers.append(e)
+
+    extracted["employers"] = clean_employers
+    result["extracted_data"] = extracted
+    if warnings:
+        result["shape_warnings"] = warnings
+    return result
+def _clean_raw_date_string(raw: str) -> str:
+    """Strips leading/trailing junk characters left over from bilingual
+    'Label / लेबल: value' style OCR text, where a stray separator (/, :,
+    comma, dash) sometimes ends up glued onto the front of an otherwise
+    perfectly parseable date. Does NOT touch the actual date digits."""
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^[\/\\:,;.\-\s]+", "", cleaned)   # strip leading junk
+    cleaned = re.sub(r"[\/\\:,;]+$", "", cleaned).strip()  # strip trailing junk too
+    return cleaned
+
 
 def _normalize_date(raw_value: Optional[str]) -> Optional[str]:
-    """Parses the LLM's verbatim-extracted date string deterministically in
-    Python, rather than trusting the LLM's own reformatting. Returns None
-    (not a guess) if the string doesn't match any real calendar date -
-    e.g. an OCR-corrupted '45-07-1993' correctly fails here."""
     if not raw_value:
         return None
-    raw_value = str(raw_value).strip()
+    raw_value = _clean_raw_date_string(str(raw_value))
     for fmt in DATE_FORMATS_TO_TRY:
         try:
             return datetime.strptime(raw_value, fmt).strftime("%Y-%m-%d")
@@ -249,7 +234,6 @@ def _normalize_date(raw_value: Optional[str]) -> Optional[str]:
 def _normalize_and_validate_dates(result: Dict[str, Any]) -> Dict[str, Any]:
     extracted = result.get("extracted_data", {})
     warnings = list(result.get("shape_warnings", []))
-
     for field in DATE_FIELDS:
         if field in extracted and extracted[field]:
             raw = extracted[field]
@@ -258,7 +242,6 @@ def _normalize_and_validate_dates(result: Dict[str, Any]) -> Dict[str, Any]:
                 warnings.append(f"{field} value '{raw}' could not be parsed as a valid date - likely OCR error, verify manually")
             else:
                 extracted[field] = normalized
-
     result["extracted_data"] = extracted
     if warnings:
         result["shape_warnings"] = warnings
@@ -277,5 +260,25 @@ def _coerce_integer_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _build_error_response(error_msg: str) -> Dict[str, Any]:
-    return {"document_type": "UNKNOWN", "confidence_score": 0.0, "extracted_data": {}, "error": error_msg}
+def _coerce_boolean_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    extracted = result.get("extracted_data", {})
+    for field in BOOLEAN_FIELDS:
+        if field in extracted and extracted[field] is not None:
+            val = extracted[field]
+            if isinstance(val, str):
+                extracted[field] = val.strip().lower() in ("true", "yes", "1")
+    result["extracted_data"] = extracted
+    return result
+
+
+def _clean_list_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    extracted = result.get("extracted_data", {})
+    for field in LIST_FIELDS:
+        if field in extracted and isinstance(extracted[field], list):
+            extracted[field] = [item for item in extracted[field] if item]
+    result["extracted_data"] = extracted
+    return result
+
+
+def _build_error_response(doc_type: str, error_msg: str) -> Dict[str, Any]:
+    return {"document_type": doc_type, "extracted_data": {}, "error": error_msg}
