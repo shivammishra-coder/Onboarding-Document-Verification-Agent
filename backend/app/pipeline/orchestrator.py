@@ -1,23 +1,20 @@
 """
-Master Orchestrator - 5 Stage Pipeline
+Master Orchestrator - vision pipeline with LAZY page rendering.
 
-Stage 1: Classification (page 1 only)
-Stage 2: Smart page extraction (offer letter -> pages 1,6,7,8,11,12; else -> all pages)
-Stage 3: Structured extraction (LLM, using the KNOWN doc_type from Stage 1)
-Stage 4: Rule engine
-Stage 5: Decision engine
+Renders page 1 ONCE, classifies from it, decides target pages from the
+doc_type, then renders ONLY the additional pages actually needed -
+reusing the already-rendered page 1 bytes when page 1 is itself one of
+the targets (e.g. SIGNED_OFFER_LETTER_JADE, where page 1 IS a target).
 """
 import asyncio
 from typing import Any, Dict, List, Optional
 
-import httpx
-
-from app.pipeline.ollama_client import get_auth_tuple
-from app.pipeline.stage1_document_classification import classify_document
-from app.pipeline.stage2_smart_extraction import extract_document_text
-from app.pipeline.stage3_structured_extraction import process_document
+from app.pipeline.document_loader import DocumentLoader
+from app.pipeline.stage1_vision_classification import classify_document
+from app.pipeline.stage2_page_selection import select_target_pages
+from app.pipeline.stage3_vision_extraction import process_document
 from app.pipeline.stage4_rule_engine import evaluate_dossier
-from app.pipeline.stage7_decision_engine import generate_final_verdict
+from backend.app.pipeline.stage5_decision_engine import generate_final_verdict
 
 
 class OnboardingOrchestrator:
@@ -27,67 +24,55 @@ class OnboardingOrchestrator:
     async def run_pipeline(self, uploaded_files: List[Dict[str, str]]) -> Dict[str, Any]:
         dossier: Dict[str, Any] = {}
         processing_errors: List[str] = []
+        semaphore = asyncio.Semaphore(4)  # caps concurrent Azure vision calls
 
-        semaphore = asyncio.Semaphore(4)  # caps concurrent Ollama calls + EasyOCR CPU load
-        timeout = httpx.Timeout(120.0, connect=15.0)
+        async def _process_single_file(file_info: Dict[str, str]) -> Optional[Dict[str, Any]]:
+            filename, path = file_info.get("originalName"), file_info.get("storedPath")
+            try:
+                async with semaphore:
+                    with DocumentLoader(path) as loader:
+                        # Render page 1 exactly ONCE
+                        page1_bytes = await asyncio.to_thread(loader.render_page, 0)
 
-        async with httpx.AsyncClient(timeout=timeout, auth=get_auth_tuple(), verify=False) as client:
-
-            async def _process_single_file(file_info: Dict[str, str]) -> Optional[Dict[str, Any]]:
-                filename = file_info.get("originalName")
-                try:
-                    async with semaphore:
-                        # ---- Stage 1: Classification (page 1 only) ----
-                        classification = await classify_document(file_info, client)
+                        # Stage 1: classify from that single rendered page
+                        classification = await classify_document(page1_bytes, filename)
                         doc_type = classification["document_type"]
 
                         if doc_type == "UNKNOWN":
                             return {
-                                "document_type": "UNKNOWN",
-                                "confidence_score": classification["confidence_score"],
-                                "extracted_data": {},
-                                "originalName": filename,
-                                "storedPath": file_info.get("storedPath"),
+                                "document_type": "UNKNOWN", "confidence_score": classification["confidence_score"],
+                                "extracted_data": {}, "originalName": filename, "storedPath": path,
                                 "warning": "Could not classify this document from its first page.",
                             }
 
-                        # ---- Stage 2: Smart page extraction, driven by doc_type ----
-                        extraction = await extract_document_text(file_info, doc_type)
+                        # Stage 2: decide which page NUMBERS are needed - nothing rendered yet
+                        target_pages = select_target_pages(loader.page_count, doc_type)
 
-                        if extraction.get("error"):
-                            processing_errors.append(f"Page extraction failed for {filename}: {extraction['error']}")
-                            return None
+                        # Render ONLY the additional pages actually needed, reusing
+                        # page 1's bytes when it's already one of the targets - this
+                        # is the fix for the double-render/double-classify issue
+                        page_images: List[bytes] = []
+                        for page_num in target_pages:
+                            if page_num == 1:
+                                page_images.append(page1_bytes)
+                            else:
+                                img_bytes = await asyncio.to_thread(loader.render_page, page_num - 1)
+                                page_images.append(img_bytes)
 
-                        raw_text = extraction.get("rawText", "")
-                        if not raw_text.strip():
-                            return {
-                                "document_type": doc_type,
-                                "confidence_score": classification["confidence_score"],
-                                "extracted_data": {},
-                                "originalName": filename,
-                                "storedPath": file_info.get("storedPath"),
-                                "pagesRead": extraction.get("pagesRead", []),
-                                "warning": "No text could be extracted from the targeted pages.",
-                            }
-
-                        # ---- Stage 3: Structured extraction - doc_type already known ----
-                        extracted_doc = await process_document(
-                            ocr_text=raw_text, doc_type=doc_type, client=client, original_filename=filename,
-                        )
+                        # Stage 3: vision extraction from exactly the pages needed
+                        extracted_doc = await process_document(page_images, doc_type, filename)
                         extracted_doc["confidence_score"] = classification["confidence_score"]
-                        extracted_doc["storedPath"] = file_info.get("storedPath")
+                        extracted_doc["storedPath"] = path
                         extracted_doc["originalName"] = filename
-                        extracted_doc["pagesRead"] = extraction.get("pagesRead", [])
+                        extracted_doc["pagesRead"] = target_pages
                         return extracted_doc
 
-                except Exception as e:
-                    processing_errors.append(f"Failed processing {filename}: {str(e)}")
-                    return None
+            except Exception as e:
+                processing_errors.append(f"Failed processing {filename}: {str(e)}")
+                return None
 
-            tasks = [_process_single_file(f) for f in uploaded_files]
-            completed_documents = await asyncio.gather(*tasks)
+        completed_documents = await asyncio.gather(*[_process_single_file(f) for f in uploaded_files])
 
-        # ---- Assemble dossier by classified type ----
         for doc in completed_documents:
             if doc:
                 doc_type = doc.get("document_type", "UNKNOWN")
@@ -101,10 +86,7 @@ class OnboardingOrchestrator:
                 else:
                     dossier.setdefault("UNKNOWN", []).append(doc)
 
-        # ---- Stage 4: Rule engine ----
         rule_engine_result = evaluate_dossier(dossier)
-
-        # ---- Stage 5: Decision engine ----
         final_verdict = generate_final_verdict(rule_report=rule_engine_result, processing_errors=processing_errors)
 
         return {
@@ -112,13 +94,7 @@ class OnboardingOrchestrator:
             "action_items": final_verdict.get("action_items", []),
             "hr_context_notes": final_verdict.get("hr_context_notes", []),
             "summary": final_verdict.get("summary"),
-            "pipeline_metrics": {
-                "total_documents_processed": len(uploaded_files),
-                "unclassified_documents": len(dossier.get("UNKNOWN", [])),
-            },
-            "detailed_reports": {
-                "step3_rule_engine": rule_engine_result,
-                "processing_errors": processing_errors,
-            },
+            "pipeline_metrics": {"total_documents_processed": len(uploaded_files), "unclassified_documents": len(dossier.get("UNKNOWN", []))},
+            "detailed_reports": {"step3_rule_engine": rule_engine_result, "processing_errors": processing_errors},
             "document_extractions": [doc for doc in completed_documents if doc],
         }

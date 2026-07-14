@@ -25,3 +25,9 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://aimodels.jadeglobal.com:
 OLLAMA_USERNAME = os.getenv("OLLAMA_USERNAME", "")
 OLLAMA_PASSWORD = os.getenv("OLLAMA_PASSWORD", "")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")       # e.g. https://your-resource.openai.azure.com
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")  # check your Azure AI Foundry deployment for the exact version gpt-5-mini requires - this changes
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")     # your deployment NAME, not the model name - these can differ
+

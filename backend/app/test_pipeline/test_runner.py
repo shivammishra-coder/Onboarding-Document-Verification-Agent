@@ -1,146 +1,240 @@
-import os
-import sys
-import glob
+"""
+test_pipeline/test_stage7_decision_engine.py
+
+Runs the REAL pipeline end-to-end on every file in your test documents
+folder - Stage 1 (vision classify) -> Stage 2 (page selection) ->
+Stage 3 (vision extraction) -> grouped into a dossier exactly like
+OnboardingOrchestrator does -> Stage 4 (evaluate_dossier) -> Stage 7
+(generate_final_verdict). No synthetic/hand-crafted inputs anywhere -
+every result shown comes from actually processing your real test
+documents through the real pipeline.
+
+Output is ordered for human readability, not test-style PASS/FAIL:
+  1. The final verdict, up front
+  2. How we got there - per-document stage detail
+  3. A compact summary at the end
+"""
 import asyncio
 import json
-from typing import List, Dict
+import os
+import sys
 
-# --- PATH FIX ---
-backend_root = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
-if backend_root not in sys.path:
-    sys.path.insert(0, backend_root)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+if BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, BACKEND_ROOT)
 
-from app.pipeline.orchestrator import OnboardingOrchestrator
+from app.pipeline.document_loader import DocumentLoader                  # noqa: E402
+from app.pipeline.stage1_vision_classification import classify_document  # noqa: E402
+from app.pipeline.stage2_page_selection import select_target_pages       # noqa: E402
+from app.pipeline.stage3_vision_extraction import process_document, DOC_TYPE_FIELDS  # noqa: E402
+from app.pipeline.stage4_rule_engine import evaluate_dossier             # noqa: E402
+from app.pipeline.stage5_decision_engine import generate_final_verdict   # noqa: E402
 
-# Point this to the folder containing your test documents
-DOCS_DIR = os.path.join(backend_root, "app", "valid_test_documents")
+TEST_DIR = os.path.join(BACKEND_ROOT, "app", "new_docs")
+SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".pdf")
+
+STATUS_LABELS = {
+    "VERIFIED": "✅ VERIFIED",
+    "PENDING_DOCUMENTS": "🕒 PENDING DOCUMENTS",
+    "NEEDS_HUMAN_REVIEW": "⚠️  NEEDS HUMAN REVIEW",
+    "SYSTEM_ERROR": "❌ SYSTEM ERROR",
+}
 
 
-def print_audit_trail(result: Dict):
-    """Formats the final pipeline output into a clean, readable dashboard."""
-    print(f"\n{'='*80}")
-    print("🚀 END-TO-END PIPELINE EXECUTION COMPLETE")
-    print(f"{'='*80}")
+async def process_one_file(filename: str) -> dict:
+    path = os.path.join(TEST_DIR, filename)
+    try:
+        with DocumentLoader(path) as loader:
+            page1_bytes = await asyncio.to_thread(loader.render_page, 0)
+            total_pages = loader.page_count
 
-    # 1. High-Level Summary
-    status = result.get("status", "UNKNOWN")
-    status_icon = "🟢" if status == "VERIFIED" else "🟡" if status == "PENDING_DOCUMENTS" else "🔴"
+            classification = await classify_document(page1_bytes, filename)
+            doc_type = classification["document_type"]
 
-    print("\n▶ FINAL DECISION ENGINE STATUS")
-    print(f"  - STATUS  : {status_icon} {status}")
-    print(f"  - SUMMARY : {result.get('summary')}")
-    print(f"  - DOCS    : Processed {result['pipeline_metrics'].get('total_documents_processed')} files.")
-    print(f"  - UNKNOWN : {result['pipeline_metrics'].get('unclassified_documents')} document(s) could not be classified.")
+            if doc_type == "UNKNOWN" or doc_type not in DOC_TYPE_FIELDS:
+                return {
+                    "originalName": filename,
+                    "document_type": "UNKNOWN",
+                    "confidence_score": classification["confidence_score"],
+                    "extracted_data": {},
+                    "pagesRead": [],
+                    "warning": "Could not classify this document from its first page.",
+                }
 
-    # 2. Per-document classification + page-extraction + field breakdown
-    print("\n▶ PER-DOCUMENT CLASSIFICATION & EXTRACTION")
-    for doc in result.get("document_extractions", []):
-        filename = doc.get("originalName", "?")
-        doc_type = doc.get("document_type", "UNKNOWN")
-        confidence = doc.get("confidence_score", 0.0)
-        pages_read = doc.get("pagesRead", [])
-        extracted = doc.get("extracted_data", {}) or {}
-        shape_warnings = doc.get("shape_warnings", [])
-        error = doc.get("error")
-        warning = doc.get("warning")
+            target_pages = select_target_pages(total_pages, doc_type)
+            page_images = []
+            for page_num in target_pages:
+                if page_num == 1:
+                    page_images.append(page1_bytes)
+                else:
+                    img_bytes = await asyncio.to_thread(loader.render_page, page_num - 1)
+                    page_images.append(img_bytes)
 
-        print(f"\n  📄 {filename}")
-        print(f"     document_type    : {doc_type}  (confidence: {confidence})")
-        if pages_read:
-            # Confirms Stage 2's page-slicing actually did what you told it to -
-            # e.g. SIGNED_OFFER_LETTER_JADE should show [1, 6, 7, 8, 11, 12]
-            # (or fewer, if the PDF has fewer pages), everything else shows
-            # the full page range it read.
-            print(f"     pages_read       : {pages_read}")
+        extracted_doc = await process_document(page_images, doc_type, filename)
+        extracted_doc["confidence_score"] = classification["confidence_score"]
+        extracted_doc["originalName"] = filename
+        extracted_doc["storedPath"] = path
+        extracted_doc["pagesRead"] = target_pages
+        return extracted_doc
 
-        if error:
-            print(f"     ❌ error         : {error}")
+    except Exception as e:
+        return {"originalName": filename, "error": f"Failed processing {filename}: {str(e)}"}
+
+
+async def run_pipeline_on_all_files():
+    """Silently processes every file, builds the dossier, runs Stage 4 + 7."""
+    files = sorted(f for f in os.listdir(TEST_DIR) if f.lower().endswith(SUPPORTED_EXTENSIONS))
+
+    dossier = {}
+    processing_errors = []
+    per_file_results = []
+
+    print(f"Processing {len(files)} document(s)...")
+    for filename in files:
+        result = await process_one_file(filename)
+        per_file_results.append(result)
+        await asyncio.sleep(1)  # gentle on the vision endpoint
+
+        if "error" in result:
+            processing_errors.append(result["error"])
             continue
 
-        if warning:
-            print(f"     ⚠️  warning       : {warning}")
-
-        if not extracted:
-            print("     (no fields expected/extracted for this type)")
+        doc_type = result.get("document_type", "UNKNOWN")
+        if doc_type != "UNKNOWN":
+            if doc_type in dossier:
+                if not isinstance(dossier[doc_type], list):
+                    dossier[doc_type] = [dossier[doc_type]]
+                dossier[doc_type].append(result)
+            else:
+                dossier[doc_type] = result
         else:
-            for field_name, value in extracted.items():
-                if value is None or value == "" or value == []:
-                    print(f"     ❌ {field_name:<28}: MISSING (null)")
-                else:
-                    print(f"     ✅ {field_name:<28}: {value}")
+            dossier.setdefault("UNKNOWN", []).append(result)
 
-        if shape_warnings:
-            print("     ⚠️  shape_warnings:")
-            for w in shape_warnings:
-                print(f"        - {w}")
+    rule_report = evaluate_dossier(dossier)
+    final_verdict = generate_final_verdict(rule_report=rule_report, processing_errors=processing_errors)
 
-    # 3. Action Items (Failures)
-    action_items = result.get("action_items", [])
+    return per_file_results, rule_report, final_verdict
+
+
+def print_verdict(final_verdict: dict):
+    status = final_verdict["status"]
+    label = STATUS_LABELS.get(status, status)
+
+    print()
+    print("=" * 70)
+    print("  FINAL VERDICT")
+    print("=" * 70)
+    print(f"  {label}")
+    print(f"  {final_verdict['summary']}")
+    print()
+
+    action_items = final_verdict.get("action_items", [])
     if action_items:
-        print("\n▶ REQUIRED ACTION ITEMS (FAILURES):")
+        print("  Action items:")
         for item in action_items:
-            print(f"    🚩 {item}")
+            print(f"    • {item}")
+    else:
+        print("  No action items - nothing further needed.")
+    print("=" * 70)
 
-    # 4. AI Context Notes
-    notes = result.get("hr_context_notes", [])
-    if notes:
-        print("\n▶ AI AUDITOR NOTES (CONTEXT):")
-        for note in notes:
-            print(f"    💡 {note}")
 
-    # 5. Processing errors (OCR/page-extraction failures that skipped a doc entirely)
-    processing_errors = result.get("detailed_reports", {}).get("processing_errors", [])
-    if processing_errors:
-        print("\n▶ PROCESSING ERRORS (documents excluded from the dossier entirely):")
-        for err in processing_errors:
-            print(f"    ⛔ {err}")
+def print_stage_by_stage(per_file_results: list, rule_report: dict):
+    print()
+    print("-" * 70)
+    print("  HOW WE GOT HERE")
+    print("-" * 70)
 
-    # 6. Raw JSON block for full debugging
-    print(f"\n{'='*80}")
-    print("RAW PIPELINE OUTPUT (JSON):")
-    print(json.dumps(result, indent=2))
-    print(f"{'='*80}\n")
+    for result in per_file_results:
+        filename = result.get("originalName", "unknown file")
+        print(f"\n  📄 {filename}")
+
+        if "error" in result:
+            print(f"     ❌ Processing failed: {result['error']}")
+            continue
+
+        doc_type = result.get("document_type", "UNKNOWN")
+        confidence = result.get("confidence_score")
+        pages_read = result.get("pagesRead", [])
+
+        print(f"     Stage 1 - Classified as : {doc_type}  (confidence: {confidence})")
+
+        if doc_type == "UNKNOWN":
+            print(f"     ⚠️  {result.get('warning', 'Could not classify this document.')}")
+            continue
+
+        print(f"     Stage 2 - Pages read     : {pages_read}")
+
+        extracted_data = result.get("extracted_data", {})
+        print("     Stage 3 - Fields extracted:")
+        if extracted_data:
+            for field, value in extracted_data.items():
+                print(f"                 {field}: {value}")
+        else:
+            print("                 (nothing extracted)")
+
+        shape_warnings = result.get("shape_warnings")
+        if shape_warnings:
+            print(f"     ⚠️  Shape warnings: {shape_warnings}")
+
+        extraction_error = result.get("error")
+        if extraction_error:
+            print(f"     ❌ Extraction error: {extraction_error}")
+
+    print(f"\n  Stage 4 - Rule engine findings:")
+    issues = rule_report.get("issues", [])
+    pending = rule_report.get("pending_documents", [])
+
+    if issues:
+        for issue in issues:
+            print(f"     • {issue}")
+    else:
+        print("     No issues found.")
+
+    if pending:
+        print(f"\n  Deferred/pending documents:")
+        for doc in pending:
+            print(f"     • {doc}")
+
+    print("-" * 70)
+
+
+def print_summary(per_file_results: list, rule_report: dict, final_verdict: dict):
+    print()
+    print("=" * 70)
+    print("  SUMMARY")
+    print("=" * 70)
+
+    classified = [r for r in per_file_results if "error" not in r and r.get("document_type") != "UNKNOWN"]
+    unclassified = [r for r in per_file_results if "error" not in r and r.get("document_type") == "UNKNOWN"]
+    failed = [r for r in per_file_results if "error" in r]
+
+    print(f"  Documents processed   : {len(per_file_results)}")
+    print(f"  Successfully classified: {len(classified)}")
+    if unclassified:
+        print(f"  Could not classify    : {len(unclassified)}  ({', '.join(r['originalName'] for r in unclassified)})")
+    if failed:
+        print(f"  Failed to process     : {len(failed)}  ({', '.join(r['originalName'] for r in failed)})")
+
+    print(f"  Rule engine issues    : {len(rule_report.get('issues', []))}")
+    print(f"  Pending documents     : {len(rule_report.get('pending_documents', []))}")
+    print(f"  Final status          : {STATUS_LABELS.get(final_verdict['status'], final_verdict['status'])}")
+    print("=" * 70)
 
 
 async def main():
-    print(f"\nScanning for documents in: {DOCS_DIR}")
-
-    supported_extensions = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.pdf")
-
-    unique_file_paths = set()
-    for ext in supported_extensions:
-        unique_file_paths.update(glob.glob(os.path.join(DOCS_DIR, ext)))
-        unique_file_paths.update(glob.glob(os.path.join(DOCS_DIR, ext.upper())))
-
-    file_paths = list(unique_file_paths)
-
-    if not file_paths:
-        print(f"⚠️ No documents found in {DOCS_DIR}. Please add some test files and try again.")
+    if not os.path.exists(TEST_DIR):
+        print(f"❌ Error: '{TEST_DIR}' does not exist.")
         return
 
-    uploaded_files: List[Dict[str, str]] = []
-    for path in file_paths:
-        uploaded_files.append({
-            "originalName": os.path.basename(path),
-            "storedPath": path
-        })
-        print(f"  📎 Loaded: {os.path.basename(path)}")
+    per_file_results, rule_report, final_verdict = await run_pipeline_on_all_files()
 
-    print("\n⚙️  Firing up the pipeline (Stage 1 classify -> Stage 2 page extraction ->")
-    print("    Stage 3 structured extraction -> Stage 4 rule engine -> Stage 5 decision)...")
-    print("    Note: Stage 1 and Stage 3 each make one Ollama call per document,")
-    print("    so total wait time scales with document count and endpoint latency.\n")
-
-    orchestrator = OnboardingOrchestrator()
-    final_result = await orchestrator.run_pipeline(uploaded_files)
-
-    print_audit_trail(final_result)
+    print_verdict(final_verdict)
+    print_stage_by_stage(per_file_results, rule_report)
+    print_summary(per_file_results, rule_report, final_verdict)
 
 
 if __name__ == "__main__":
-    if os.name == 'nt':
+    if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
     asyncio.run(main())
